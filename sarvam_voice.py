@@ -1,25 +1,53 @@
 """
-Sarvam AI voice utilities for the Booth Agent.
+Sarvam AI voice utilities for Arjun / Booth Agent.
 
 Pipeline:
-    microphone audio -> Sarvam Saaras STT -> Booth Agent -> Sarvam Bulbul TTS
+
+    Streamlit microphone
+        ->
+    Sarvam Saaras STT
+        ->
+    Arjun
+        ->
+    Sarvam Bulbul TTS
 """
 
 from __future__ import annotations
 
 import base64
-from io import BytesIO
 
+import requests
 from sarvamai import SarvamAI
 
 
-def get_client(api_key: str) -> SarvamAI:
-    if not api_key:
-        raise ValueError(
-            "SARVAM_API_KEY is not configured. Add it to .env or Streamlit secrets."
-        )
-    return SarvamAI(api_subscription_key=api_key)
+# ---------------------------------------------------------------------------
+# Sarvam endpoints
+# ---------------------------------------------------------------------------
 
+SARVAM_STT_URL = "https://api.sarvam.ai/speech-to-text"
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
+def get_client(api_key: str) -> SarvamAI:
+    """Create a Sarvam SDK client."""
+
+    if not api_key or not api_key.strip():
+        raise ValueError(
+            "SARVAM_API_KEY is not configured. "
+            "Add it to Streamlit secrets or .env."
+        )
+
+    return SarvamAI(
+        api_subscription_key=api_key.strip()
+    )
+
+
+# ---------------------------------------------------------------------------
+# Speech to Text
+# ---------------------------------------------------------------------------
 
 def speech_to_text(
     audio_file,
@@ -29,19 +57,39 @@ def speech_to_text(
     mode: str = "transcribe",
 ):
     """
-    Transcribe a Streamlit UploadedFile/file-like object with Sarvam.
+    Transcribe a Streamlit UploadedFile using Sarvam's REST API.
 
-    Streamlit/browser audio can sometimes report the MIME type as
-    `audio/vnd.wave`, which Sarvam rejects even though it accepts
-    `audio/wav`.
+    IMPORTANT:
 
-    We therefore normalize the MIME type and send the audio as a
-    standard WAV file.
+    We intentionally do NOT pass the Streamlit UploadedFile directly
+    into the Sarvam SDK.
+
+    Streamlit Cloud can report browser microphone recordings with:
+
+        audio/vnd.wave
+
+    Sarvam accepts:
+
+        audio/wav
+        audio/x-wav
+        audio/wave
+
+    Therefore we read the bytes ourselves and explicitly construct
+    the multipart request with:
+
+        filename     = audio.wav
+        Content-Type = audio/wav
     """
 
-    client = get_client(api_key)
+    if not api_key or not api_key.strip():
+        raise ValueError(
+            "SARVAM_API_KEY is not configured."
+        )
 
-    # Read the complete uploaded audio payload.
+    # -----------------------------------------------------------------------
+    # Read the complete Streamlit upload
+    # -----------------------------------------------------------------------
+
     try:
         audio_file.seek(0)
     except Exception:
@@ -50,33 +98,139 @@ def speech_to_text(
     audio_bytes = audio_file.read()
 
     if not audio_bytes:
-        raise ValueError("No audio data was received.")
+        raise ValueError(
+            "The recorded audio file is empty."
+        )
 
-    # Always send a normal WAV MIME type to Sarvam.
-    #
-    # The important part of this fix is that we do NOT pass the original
-    # Streamlit UploadedFile directly, because its MIME type can be:
-    #
-    #     audio/vnd.wave
-    #
-    # Sarvam rejects that value.
-    #
-    # BytesIO alone does not necessarily give the SDK the MIME type we want,
-    # so create a file-like object with a standard `.name`.
-    normalized_audio = BytesIO(audio_bytes)
-    normalized_audio.name = "audio.wav"
+    # -----------------------------------------------------------------------
+    # Diagnostic information
+    # -----------------------------------------------------------------------
 
-    response = client.speech_to_text.transcribe(
-        file=normalized_audio,
-        model=model,
-        mode=mode,
+    original_name = getattr(
+        audio_file,
+        "name",
+        None,
     )
 
-    transcript = getattr(response, "transcript", "") or ""
-    language_code = getattr(response, "language_code", None) or "hi-IN"
+    original_type = getattr(
+        audio_file,
+        "type",
+        None,
+    )
 
-    return transcript.strip(), language_code
+    print(
+        "[Sarvam STT] "
+        f"original_name={original_name!r}, "
+        f"original_type={original_type!r}, "
+        f"size={len(audio_bytes)} bytes"
+    )
 
+    # -----------------------------------------------------------------------
+    # IMPORTANT:
+    #
+    # requests allows:
+    #
+    #     (filename, file_bytes, content_type)
+    #
+    # This forces the multipart part to be:
+    #
+    #     filename = audio.wav
+    #     Content-Type = audio/wav
+    #
+    # Streamlit's original MIME type is therefore ignored.
+    # -----------------------------------------------------------------------
+
+    files = {
+        "file": (
+            "audio.wav",
+            audio_bytes,
+            "audio/wav",
+        )
+    }
+
+    data = {
+        "model": model,
+        "mode": mode,
+    }
+
+    headers = {
+        "api-subscription-key": api_key.strip(),
+    }
+
+    print(
+        "[Sarvam STT] "
+        "sending filename='audio.wav', "
+        "content_type='audio/wav', "
+        f"model={model!r}, "
+        f"mode={mode!r}"
+    )
+
+    # -----------------------------------------------------------------------
+    # Call Sarvam
+    # -----------------------------------------------------------------------
+
+    try:
+        response = requests.post(
+            SARVAM_STT_URL,
+            headers=headers,
+            data=data,
+            files=files,
+            timeout=60,
+        )
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Could not connect to Sarvam STT: {exc}"
+        ) from exc
+
+    # -----------------------------------------------------------------------
+    # Handle HTTP errors
+    # -----------------------------------------------------------------------
+
+    if not response.ok:
+        try:
+            error_body = response.json()
+        except Exception:
+            error_body = response.text
+
+        raise RuntimeError(
+            "Sarvam STT request failed.\n"
+            f"HTTP status: {response.status_code}\n"
+            f"Response: {error_body}"
+        )
+
+    # -----------------------------------------------------------------------
+    # Parse response
+    # -----------------------------------------------------------------------
+
+    try:
+        result = response.json()
+    except Exception as exc:
+        raise RuntimeError(
+            "Sarvam STT returned an invalid JSON response.\n"
+            f"Response: {response.text[:1000]}"
+        ) from exc
+
+    print(
+        "[Sarvam STT] "
+        f"response keys={list(result.keys())}"
+    )
+
+    transcript = (
+        result.get("transcript")
+        or ""
+    ).strip()
+
+    language_code = (
+        result.get("language_code")
+        or "hi-IN"
+    )
+
+    return transcript, language_code
+
+
+# ---------------------------------------------------------------------------
+# Text to Speech
+# ---------------------------------------------------------------------------
 
 def text_to_speech(
     text: str,
@@ -87,14 +241,18 @@ def text_to_speech(
     speaker: str = "shubh",
     pace: float = 1.0,
 ) -> bytes:
-    """Synthesize text with Sarvam Bulbul and return WAV bytes."""
+    """
+    Synthesize text using Sarvam Bulbul.
+
+    TTS continues to use the Sarvam Python SDK.
+    """
 
     text = (text or "").strip()
 
     if not text:
         return b""
 
-    # Bulbul v3 accepts up to 2500 characters per REST request.
+    # Bulbul v3 request limit.
     if len(text) > 2500:
         text = text[:2497].rstrip() + "..."
 
@@ -110,10 +268,16 @@ def text_to_speech(
         speech_sample_rate=24000,
     )
 
-    audios = getattr(response, "audios", None) or []
+    audios = getattr(
+        response,
+        "audios",
+        None,
+    ) or []
 
     if not audios:
-        raise RuntimeError("Sarvam TTS returned no audio.")
+        raise RuntimeError(
+            "Sarvam TTS returned no audio."
+        )
 
     audio = audios[0]
 
@@ -123,8 +287,16 @@ def text_to_speech(
     return base64.b64decode(audio)
 
 
-def audio_bytes_to_data_url(audio_bytes: bytes) -> str:
-    """Convert audio bytes to a browser-playable data URL if needed."""
+# ---------------------------------------------------------------------------
+# Browser helper
+# ---------------------------------------------------------------------------
+
+def audio_bytes_to_data_url(
+    audio_bytes: bytes,
+) -> str:
+    """
+    Convert WAV bytes to a browser-playable data URL.
+    """
 
     return (
         "data:audio/wav;base64,"
